@@ -1,518 +1,477 @@
 const express = require('express');
+const cors = require('cors');
 const axios = require('axios');
 const admin = require('firebase-admin');
-const cors = require('cors');
-require('dotenv').config();
 
 const app = express();
-app.use(cors());
+
+// ===== MIDDLEWARE =====
+app.use(cors({
+  origin: process.env.FRONTEND_URL || '*',
+  credentials: true
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Configuration Firebase Admin SDK
-// Railway utilisera la variable d'environnement FIREBASE_SERVICE_ACCOUNT
-let serviceAccount;
-try {
-  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-} catch (error) {
-  console.error('Error parsing Firebase credentials:', error);
-  throw new Error('Invalid FIREBASE_SERVICE_ACCOUNT');
+// ===== FIREBASE INIT (v8 compatible) =====
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n')
+    }),
+    databaseURL: process.env.FIREBASE_DATABASE_URL
+  });
 }
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
 
 const db = admin.firestore();
 
-// Configuration EziPay
-const BASE_URL = process.env.EZIPAY_BASE_URL || 'https://sandbox.ezipaywallet.com/merchant/api';
-const CLIENT_ID = process.env.EZIPAY_CLIENT_ID;
-const CLIENT_SECRET = process.env.EZIPAY_CLIENT_SECRET;
+// ===== CONFIG EZIPAY =====
+const EZIPAY_BASE_URL = 'https://ezipaywallet.com/merchant/api';
+const EZIPAY_CLIENT_ID = process.env.EZIPAY_CLIENT_ID;
+const EZIPAY_CLIENT_SECRET = process.env.EZIPAY_CLIENT_SECRET;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://chanpyon509.com';
+const SUBSCRIPTION_PRICE = 5; // HTG (TEST)
+const SUBSCRIPTION_CURRENCY = 'HTG';
+const SUBSCRIPTION_DURATION_DAYS = 30;
 
-// Cache du token
-let accessToken = null;
+// ===== CACHE TOKEN EZIPAY =====
+let cachedToken = null;
 let tokenExpiry = null;
 
-// Fonction pour obtenir le token d'accès
-async function getAccessToken() {
-  try {
-    if (accessToken && tokenExpiry && Date.now() < tokenExpiry) {
-      return accessToken;
-    }
+async function getEziPayToken() {
+  // Retourner le token en cache s'il est encore valide (avec marge de 5 min)
+  if (cachedToken && tokenExpiry && Date.now() < tokenExpiry) {
+    console.log('♻️ [TOKEN] Utilisation du token en cache');
+    return cachedToken;
+  }
 
-    const response = await axios.post(`${BASE_URL}/access-token`, {
-      client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET
+  try {
+    console.log('🔑 [TOKEN] Demande d\'un nouveau token EziPay...');
+    
+    const response = await axios.post(`${EZIPAY_BASE_URL}/access-token`, {
+      client_id: EZIPAY_CLIENT_ID,
+      client_secret: EZIPAY_CLIENT_SECRET
+    }, {
+      headers: { 'Content-Type': 'application/json' }
     });
 
+    console.log('📦 [TOKEN] Réponse EziPay:', response.data);
+
     if (response.data.status === 'success') {
-      accessToken = response.data.data.access_token;
-      tokenExpiry = Date.now() + (2 * 60 * 60 * 1000);
-      return accessToken;
+      cachedToken = response.data.data.access_token;
+      // Token valide 2h, on met une marge de 5 min
+      tokenExpiry = Date.now() + (2 * 60 * 60 * 1000) - (5 * 60 * 1000);
+      
+      console.log('✅ [TOKEN] Token EziPay obtenu, expire dans ~2h');
+      return cachedToken;
+    } else {
+      throw new Error('Réponse EziPay invalide pour le token');
     }
-    throw new Error('Failed to get access token');
   } catch (error) {
-    console.error('Error getting access token:', error.response?.data || error.message);
-    throw error;
+    console.error('❌ [TOKEN] Erreur obtention token:', error.response?.data || error.message);
+    throw new Error('Impossible d\'obtenir le token EziPay');
   }
 }
 
-// Route santé
-app.get('/', (req, res) => {
+// ===== ROUTE: SANTÉ DU SERVEUR =====
+app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    message: 'EziPay API Server is running',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    ezipay_base_url: EZIPAY_BASE_URL,
+    frontend_url: FRONTEND_URL,
+    firebase_connected: !!admin.apps.length
   });
 });
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', message: 'API is healthy' });
-});
+// ===== ROUTE: INITIER PAIEMENT ABONNEMENT =====
+app.post('/api/subscribe', async (req, res) => {
+  const { userId } = req.body;
 
-// Route pour créer un paiement (dépôt)
-app.post('/api/payment/create', async (req, res) => {
+  console.log('💳 [SUBSCRIBE] Demande:', { 
+    userId, 
+    amount: SUBSCRIPTION_PRICE, 
+    currency: SUBSCRIPTION_CURRENCY,
+    timestamp: new Date().toISOString()
+  });
+
+  if (!userId) {
+    console.log('❌ [SUBSCRIBE] userId manquant');
+    return res.status(400).json({ success: false, error: 'userId requis' });
+  }
+
   try {
-    const { amount, currency, metadata, userId } = req.body;
-    
-    if (!amount || !currency) {
-      return res.status(400).json({ error: 'Amount and currency are required' });
+    // 1. Vérifier que l'utilisateur existe
+    const userRef = db.collection('users').doc(userId);
+    const userDoc = await userRef.get();
+
+    if (!userDoc.exists) {
+      console.log('❌ [SUBSCRIBE] Utilisateur non trouvé:', userId);
+      return res.status(404).json({ success: false, error: 'Utilisateur non trouvé' });
     }
 
-    const token = await getAccessToken();
+    // 2. Obtenir le token EziPay
+    const token = await getEziPayToken();
+
+    // 3. Créer la transaction de paiement selon la doc EziPay
+    console.log('📤 [SUBSCRIBE] Envoi requête à EziPay...');
     
-    const response = await axios.post(
-      `${BASE_URL}/transaction/create`,
+    const ezipayResponse = await axios.post(
+      `${EZIPAY_BASE_URL}/transaction/create`,
       {
-        amount: parseInt(amount),
-        currency: currency,
-        successUrl: `${process.env.APP_URL || 'https://your-app.railway.app'}/payment/success`,
-        cancelUrl: `${process.env.APP_URL || 'https://your-app.railway.app'}/payment/cancel`,
-        metadata: metadata ? JSON.stringify(metadata) : null
+        amount: SUBSCRIPTION_PRICE,
+        currency: SUBSCRIPTION_CURRENCY,
+        successUrl: `${FRONTEND_URL}/ezipay-paiement.html?subscription=success`,
+        cancelUrl: `${FRONTEND_URL}/ezipay-paiement.html?subscription=cancel`,
+        metadata: JSON.stringify({ userId, type: 'subscription' })
       },
-      {
-        headers: {
+      { 
+        headers: { 
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json'
-        }
+        } 
       }
     );
 
-    // Sauvegarder dans Firestore
-    if (response.data.status === 'success') {
-      await db.collection('payments').add({
-        grant_id: response.data.data.grant_id,
-        token: response.data.data.token,
-        amount: parseInt(amount),
-        currency: currency,
-        userId: userId || null,
-        metadata: metadata || null,
-        status: 'pending',
-        created_at: admin.firestore.FieldValue.serverTimestamp()
-      });
-    }
+    console.log('📦 [SUBSCRIBE] Réponse EziPay:', ezipayResponse.data);
 
-    res.json(response.data);
+    if (ezipayResponse.data.status === 'success') {
+      const grantId = ezipayResponse.data.data.grant_id;
+      const paymentUrl = ezipayResponse.data.data.payment_url;
+
+      // 4. Sauvegarder la transaction en attente dans Firestore
+      await db.collection('subscription_transactions').add({
+        userId: userId,
+        grantId: grantId,
+        amount: SUBSCRIPTION_PRICE,
+        currency: SUBSCRIPTION_CURRENCY,
+        status: 'pending',
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+      console.log('✅ [SUBSCRIBE] Transaction créée, grant_id:', grantId);
+
+      res.json({
+        success: true,
+        payment_url: paymentUrl,
+        grantId: grantId,
+        amount: SUBSCRIPTION_PRICE,
+        currency: SUBSCRIPTION_CURRENCY
+      });
+    } else {
+      throw new Error('Erreur création transaction EziPay');
+    }
   } catch (error) {
-    console.error('Error creating payment:', error.response?.data || error.message);
+    console.error('❌ [SUBSCRIBE] Erreur:', error.response?.data || error.message);
     res.status(500).json({ 
-      error: 'Failed to create payment',
-      details: error.response?.data || error.message 
+      success: false, 
+      error: error.response?.data?.message || error.message 
     });
   }
 });
 
-// Route pour vérifier le statut d'un paiement
-app.get('/api/payment/status/:transactionId', async (req, res) => {
-  try {
-    const { transactionId } = req.params;
-    const token = await getAccessToken();
+// ===== ROUTE: VÉRIFIER PAIEMENT ET ACTIVER ABONNEMENT =====
+app.post('/api/verify-subscription', async (req, res) => {
+  const { transactionId, userId } = req.body;
 
-    const response = await axios.get(
-      `${BASE_URL}/transaction/get/${transactionId}`,
-      {
-        headers: {
-          'Authorization': `Bearer ${token}`
-        }
+  console.log('🔍 [VERIFY] Demande:', { 
+    transactionId, 
+    userId,
+    timestamp: new Date().toISOString()
+  });
+
+  if (!transactionId || !userId) {
+    console.log('❌ [VERIFY] Paramètres manquants');
+    return res.status(400).json({ 
+      success: false, 
+      error: 'transactionId et userId requis' 
+    });
+  }
+
+  try {
+    // 1. Obtenir le token EziPay
+    const token = await getEziPayToken();
+
+    // 2. Vérifier le statut de la transaction avec EziPay (selon la doc)
+    console.log('📞 [VERIFY] Appel API EziPay GET /transaction/get/' + transactionId);
+    
+    const ezipayResponse = await axios.get(
+      `${EZIPAY_BASE_URL}/transaction/get/${transactionId}`,
+      { 
+        headers: { 
+          'Authorization': `Bearer ${token}` 
+        } 
       }
     );
 
-    // Mettre à jour dans Firestore
-    if (response.data && !response.data.error) {
-      const paymentsRef = db.collection('payments');
-      const snapshot = await paymentsRef.where('grant_id', '==', transactionId).limit(1).get();
-      
-      if (!snapshot.empty) {
-        await snapshot.docs[0].ref.update({
-          status: response.data.data.status.toLowerCase(),
-          transaction_id: transactionId,
-          fees: response.data.data.fees,
-          updated_at: admin.firestore.FieldValue.serverTimestamp()
+    console.log('📊 [VERIFY] Réponse EziPay:', ezipayResponse.data);
+
+    // 3. Vérifier le format de la réponse selon la doc
+    if (ezipayResponse.data.error === false && ezipayResponse.data.data) {
+      const transactionData = ezipayResponse.data.data;
+      const transactionStatus = transactionData.status;
+      const amount = parseFloat(transactionData.amount);
+      const fees = parseFloat(transactionData.fees);
+
+      console.log('📊 [VERIFY] Statut:', transactionStatus, '| Montant:', amount, '| Frais:', fees);
+
+      if (transactionStatus === 'Success') {
+        // ✅ PAIEMENT RÉUSSI -> ACTIVER ABONNEMENT
+        
+        console.log('✅ [VERIFY] Paiement confirmé, activation abonnement...');
+
+        const now = new Date();
+        const expiresAt = new Date(now.getTime() + SUBSCRIPTION_DURATION_DAYS * 24 * 60 * 60 * 1000);
+
+        // Vérifier que l'utilisateur existe
+        const userRef = db.collection('users').doc(userId);
+        const userDoc = await userRef.get();
+
+        if (!userDoc.exists) {
+          console.log('❌ [VERIFY] Utilisateur non trouvé:', userId);
+          return res.status(404).json({ 
+            success: false, 
+            message: 'Utilisateur non trouvé' 
+          });
+        }
+
+        // Activer l'abonnement (compatible Firebase v8)
+        await userRef.update({
+          subscription: {
+            active: true,
+            startDate: admin.firestore.FieldValue.serverTimestamp(),
+            expiresAt: expiresAt,
+            transactionId: transactionId,
+            amount: amount,
+            currency: SUBSCRIPTION_CURRENCY
+          }
+        });
+
+        // Enregistrer la transaction dans l'historique de l'utilisateur
+        await userRef.collection('transactions').add({
+          type: 'subscription',
+          amount: amount,
+          fees: fees,
+          currency: SUBSCRIPTION_CURRENCY,
+          status: 'completed',
+          transactionId: transactionId,
+          date: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        // Mettre à jour la transaction globale
+        const transactionQuery = await db.collection('subscription_transactions')
+          .where('userId', '==', userId)
+          .where('status', '==', 'pending')
+          .orderBy('createdAt', 'desc')
+          .limit(1)
+          .get();
+
+        if (!transactionQuery.empty) {
+          await transactionQuery.docs[0].ref.update({
+            status: 'completed',
+            transactionId: transactionId,
+            completedAt: admin.firestore.FieldValue.serverTimestamp(),
+            expiresAt: expiresAt
+          });
+        }
+
+        console.log('✅ [VERIFY] Abonnement activé pour:', userId, '| Expire:', expiresAt.toISOString());
+
+        res.json({
+          success: true,
+          message: 'Abonnement activé avec succès',
+          expiresAt: expiresAt.toISOString(),
+          amount: amount,
+          fees: fees
+        });
+      } else {
+        // Paiement non réussi
+        console.log('⚠️ [VERIFY] Paiement non confirmé:', transactionStatus);
+        
+        res.json({
+          success: false,
+          message: `Paiement ${transactionStatus}`,
+          status: transactionStatus
         });
       }
+    } else {
+      throw new Error('Format de réponse EziPay invalide');
     }
-
-    res.json(response.data);
   } catch (error) {
-    console.error('Error getting payment status:', error.response?.data || error.message);
-    res.status(500).json({ 
-      error: 'Failed to get payment status',
-      details: error.response?.data || error.message 
-    });
-  }
-});
-
-// Route pour obtenir les méthodes de paiement
-app.post('/api/payment-methods', async (req, res) => {
-  try {
-    const { currency } = req.body;
+    console.error('❌ [VERIFY] Erreur:', error.response?.data || error.message);
     
-    if (!currency) {
-      return res.status(400).json({ error: 'Currency is required' });
-    }
-
-    const token = await getAccessToken();
-
-    const response = await axios.post(
-      `${BASE_URL}/send-money/get/payment-methods`,
-      { currency: currency },
-      {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    res.json(response.data);
-  } catch (error) {
-    console.error('Error getting payment methods:', error.response?.data || error.message);
-    res.status(500).json({ 
-      error: 'Failed to get payment methods',
-      details: error.response?.data || error.message 
-    });
-  }
-});
-
-// Route pour vérifier un destinataire
-app.post('/api/verify-receiver', async (req, res) => {
-  try {
-    const { email_or_phone } = req.body;
-    
-    if (!email_or_phone) {
-      return res.status(400).json({ error: 'Email or phone is required' });
-    }
-
-    const token = await getAccessToken();
-
-    const response = await axios.post(
-      `${BASE_URL}/send-money/verify-receiver`,
-      { email_or_phone: email_or_phone },
-      {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    res.json(response.data);
-  } catch (error) {
-    console.error('Error verifying receiver:', error.response?.data || error.message);
-    res.status(500).json({ 
-      error: 'Failed to verify receiver',
-      details: error.response?.data || error.message 
-    });
-  }
-});
-
-// Route pour créer une demande de retrait
-app.post('/api/withdrawal/request', async (req, res) => {
-  try {
-    const { email_or_phone, currency, amount, payment_method_id, moncash_account_number, userId, userEmail } = req.body;
-    
-    if (!email_or_phone || !currency || !amount || !payment_method_id) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
-
-    // Vérifier le destinataire
-    const token = await getAccessToken();
-    const verifyResponse = await axios.post(
-      `${BASE_URL}/send-money/verify-receiver`,
-      { email_or_phone: email_or_phone },
-      {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    if (verifyResponse.data.status !== 'success') {
-      return res.status(400).json({ error: 'Invalid receiver' });
-    }
-
-    // Créer la demande dans Firestore
-    const withdrawalRef = await db.collection('withdrawals').add({
-      email_or_phone,
-      currency,
-      amount: parseInt(amount),
-      payment_method_id: parseInt(payment_method_id),
-      moncash_account_number: moncash_account_number || null,
-      userId: userId || null,
-      userEmail: userEmail || null,
-      receiver_info: verifyResponse.data.data,
-      status: 'pending',
-      created_at: admin.firestore.FieldValue.serverTimestamp(),
-      processed_at: null,
-      processed_by: null
-    });
-
-    res.json({
-      status: 'success',
-      message: 'Withdrawal request submitted. Waiting for admin approval.',
-      data: {
-        withdrawal_id: withdrawalRef.id,
-        status: 'pending'
-      }
-    });
-  } catch (error) {
-    console.error('Error creating withdrawal request:', error.response?.data || error.message);
-    res.status(500).json({ 
-      error: 'Failed to create withdrawal request',
-      details: error.response?.data || error.message 
-    });
-  }
-});
-
-// Route pour obtenir toutes les demandes de retrait (Admin)
-app.get('/api/admin/withdrawals', async (req, res) => {
-  try {
-    const { status, limit = 100 } = req.query;
-    
-    let query = db.collection('withdrawals').orderBy('created_at', 'desc');
-    
-    if (status && status !== 'all') {
-      query = query.where('status', '==', status);
-    }
-    
-    query = query.limit(parseInt(limit));
-    
-    const snapshot = await query.get();
-    
-    const withdrawals = [];
-    snapshot.forEach(doc => {
-      withdrawals.push({
-        id: doc.id,
-        ...doc.data(),
-        created_at: doc.data().created_at?.toDate().toISOString(),
-        processed_at: doc.data().processed_at?.toDate().toISOString()
+    // Si l'erreur vient d'EziPay (404 = transaction non trouvée)
+    if (error.response?.status === 404) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Transaction non trouvée sur EziPay',
+        error: 'Transaction ID invalide ou expirée'
       });
+    }
+    
+    res.status(500).json({ 
+      success: false, 
+      error: error.response?.data?.message || error.message 
     });
-
-    res.json({
-      status: 'success',
-      data: withdrawals
-    });
-  } catch (error) {
-    console.error('Error fetching withdrawals:', error.message);
-    res.status(500).json({ error: 'Failed to fetch withdrawals' });
   }
 });
 
-// Route pour approuver un retrait (Admin)
-app.post('/api/admin/withdrawal/approve/:id', async (req, res) => {
+// ===== ROUTE: CRÉER UN RETRAIT =====
+app.post('/api/create-withdrawal', async (req, res) => {
+  const { userId, amount, currency, emailOrPhone, paymentMethodId } = req.body;
+
+  console.log('💸 [WITHDRAWAL] Demande:', { 
+    userId, 
+    amount, 
+    currency, 
+    emailOrPhone, 
+    paymentMethodId,
+    timestamp: new Date().toISOString()
+  });
+
+  // Validation des paramètres
+  if (!userId || !amount || !currency || !emailOrPhone || !paymentMethodId) {
+    console.log('❌ [WITHDRAWAL] Paramètres manquants');
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Tous les paramètres sont requis' 
+    });
+  }
+
   try {
-    const { id } = req.params;
-    const { adminId } = req.body;
-    
-    const withdrawalRef = db.collection('withdrawals').doc(id);
-    const withdrawalDoc = await withdrawalRef.get();
+    // 1. Vérifier le solde de l'utilisateur
+    const userRef = db.collection('users').doc(userId);
+    const userDoc = await userRef.get();
 
-    if (!withdrawalDoc.exists) {
-      return res.status(404).json({ error: 'Withdrawal not found' });
+    if (!userDoc.exists) {
+      console.log('❌ [WITHDRAWAL] Utilisateur non trouvé:', userId);
+      return res.status(404).json({ success: false, error: 'Utilisateur non trouvé' });
     }
 
-    const withdrawal = withdrawalDoc.data();
+    const balance = userDoc.data().balance || 0;
+    const fees = amount * 0.06; // 6% de frais
+    const totalDebit = amount + fees;
 
-    if (withdrawal.status !== 'pending') {
-      return res.status(400).json({ error: 'Withdrawal already processed' });
+    console.log('💰 [WITHDRAWAL] Solde:', balance, '| Total à débiter:', totalDebit);
+
+    if (totalDebit > balance) {
+      console.log('❌ [WITHDRAWAL] Solde insuffisant');
+      return res.status(400).json({ success: false, error: 'Solde insuffisant' });
     }
 
-    // Exécuter le transfert via EziPay
-    const token = await getAccessToken();
+    // 2. Obtenir le token EziPay
+    const token = await getEziPayToken();
+
+    // 3. Créer le retrait via EziPay (selon la doc)
+    console.log('📤 [WITHDRAWAL] Envoi requête à EziPay...');
     
     const requestData = {
-      email_or_phone: withdrawal.email_or_phone,
-      currency: withdrawal.currency,
-      amount: withdrawal.amount,
-      payment_method_id: withdrawal.payment_method_id
+      email_or_phone: emailOrPhone,
+      currency: currency,
+      amount: amount,
+      payment_method_id: parseInt(paymentMethodId)
     };
 
-    if (withdrawal.moncash_account_number) {
-      requestData.moncash_account_number = withdrawal.moncash_account_number;
+    // Si MonCash (id 16), ajouter le numéro de compte
+    if (parseInt(paymentMethodId) === 16) {
+      requestData.moncash_account_number = emailOrPhone;
     }
 
-    const response = await axios.post(
-      `${BASE_URL}/send-money/create`,
+    const ezipayResponse = await axios.post(
+      `${EZIPAY_BASE_URL}/send-money/create`,
       requestData,
-      {
-        headers: {
+      { 
+        headers: { 
           'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json'
-        }
+        } 
       }
     );
 
-    // Mettre à jour le statut dans Firestore
-    await withdrawalRef.update({
-      status: 'approved',
-      processed_at: admin.firestore.FieldValue.serverTimestamp(),
-      processed_by: adminId || 'admin',
-      ezipay_response: response.data
-    });
+    console.log('📦 [WITHDRAWAL] Réponse EziPay:', ezipayResponse.data);
 
-    const updatedDoc = await withdrawalRef.get();
-    const updatedData = {
-      id: updatedDoc.id,
-      ...updatedDoc.data(),
-      created_at: updatedDoc.data().created_at?.toDate().toISOString(),
-      processed_at: updatedDoc.data().processed_at?.toDate().toISOString()
-    };
+    if (ezipayResponse.data.status === 'success') {
+      // 4. Débiter le compte
+      const newBalance = balance - totalDebit;
+      await userRef.update({ balance: newBalance });
 
-    res.json({
-      status: 'success',
-      message: 'Withdrawal approved and processed',
-      data: updatedData
-    });
-  } catch (error) {
-    console.error('Error approving withdrawal:', error.response?.data || error.message);
-    
-    // Marquer comme échoué
-    try {
-      await db.collection('withdrawals').doc(req.params.id).update({
-        status: 'failed',
-        processed_at: admin.firestore.FieldValue.serverTimestamp(),
-        error_message: error.response?.data?.message || error.message
+      // 5. Enregistrer la transaction
+      await userRef.collection('transactions').add({
+        type: 'withdrawal',
+        amount: amount,
+        totalDebit: totalDebit,
+        fees: fees,
+        currency: currency,
+        emailOrPhone: emailOrPhone,
+        paymentMethodId: paymentMethodId,
+        status: 'completed',
+        date: admin.firestore.FieldValue.serverTimestamp()
       });
-    } catch (updateError) {
-      console.error('Error updating failed status:', updateError);
-    }
 
+      console.log('✅ [WITHDRAWAL] Retrait effectué, nouveau solde:', newBalance);
+
+      res.json({
+        success: true,
+        message: 'Retrait effectué avec succès',
+        newBalance: newBalance,
+        totalDebit: totalDebit
+      });
+    } else {
+      throw new Error('Erreur lors du retrait EziPay');
+    }
+  } catch (error) {
+    console.error('❌ [WITHDRAWAL] Erreur:', error.response?.data || error.message);
     res.status(500).json({ 
-      error: 'Failed to process withdrawal',
-      details: error.response?.data || error.message 
+      success: false, 
+      error: error.response?.data?.message || error.message 
     });
   }
 });
 
-// Route pour rejeter un retrait (Admin)
-app.post('/api/admin/withdrawal/reject/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { reason, adminId } = req.body;
-    
-    const withdrawalRef = db.collection('withdrawals').doc(id);
-    const withdrawalDoc = await withdrawalRef.get();
+// ===== ROUTE: OBTENIR LES MÉTHODES DE PAIEMENT =====
+app.post('/api/get-payment-methods', async (req, res) => {
+  const { currency } = req.body;
 
-    if (!withdrawalDoc.exists) {
-      return res.status(404).json({ error: 'Withdrawal not found' });
-    }
+  console.log('💳 [PAYMENT-METHODS] Demande:', { currency });
 
-    const withdrawal = withdrawalDoc.data();
-
-    if (withdrawal.status !== 'pending') {
-      return res.status(400).json({ error: 'Withdrawal already processed' });
-    }
-
-    await withdrawalRef.update({
-      status: 'rejected',
-      processed_at: admin.firestore.FieldValue.serverTimestamp(),
-      processed_by: adminId || 'admin',
-      rejection_reason: reason || 'No reason provided'
-    });
-
-    const updatedDoc = await withdrawalRef.get();
-    const updatedData = {
-      id: updatedDoc.id,
-      ...updatedDoc.data(),
-      created_at: updatedDoc.data().created_at?.toDate().toISOString(),
-      processed_at: updatedDoc.data().processed_at?.toDate().toISOString()
-    };
-
-    res.json({
-      status: 'success',
-      message: 'Withdrawal rejected',
-      data: updatedData
-    });
-  } catch (error) {
-    console.error('Error rejecting withdrawal:', error.message);
-    res.status(500).json({ error: 'Failed to reject withdrawal' });
+  if (!currency) {
+    return res.status(400).json({ success: false, error: 'currency requis (HTG ou USD)' });
   }
-});
 
-// Route pour obtenir le statut d'une demande de retrait
-app.get('/api/withdrawal/status/:id', async (req, res) => {
   try {
-    const { id } = req.params;
-    
-    const withdrawalDoc = await db.collection('withdrawals').doc(id).get();
+    const token = await getEziPayToken();
 
-    if (!withdrawalDoc.exists) {
-      return res.status(404).json({ error: 'Withdrawal not found' });
-    }
-
-    const withdrawal = withdrawalDoc.data();
-
-    res.json({
-      status: 'success',
-      data: {
-        withdrawal_id: id,
-        status: withdrawal.status,
-        amount: withdrawal.amount,
-        currency: withdrawal.currency,
-        created_at: withdrawal.created_at?.toDate().toISOString(),
-        processed_at: withdrawal.processed_at?.toDate().toISOString()
+    const ezipayResponse = await axios.post(
+      `${EZIPAY_BASE_URL}/send-money/get/payment-methods`,
+      { currency: currency },
+      { 
+        headers: { 
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        } 
       }
-    });
+    );
+
+    console.log('📦 [PAYMENT-METHODS] Réponse:', ezipayResponse.data);
+
+    if (ezipayResponse.data.status === 'success') {
+      res.json({
+        success: true,
+        methods: ezipayResponse.data.data
+      });
+    } else {
+      throw new Error('Erreur récupération méthodes de paiement');
+    }
   } catch (error) {
-    console.error('Error fetching withdrawal status:', error.message);
-    res.status(500).json({ error: 'Failed to fetch withdrawal status' });
+    console.error('❌ [PAYMENT-METHODS] Erreur:', error.response?.data || error.message);
+    res.status(500).json({ 
+      success: false, 
+      error: error.response?.data?.message || error.message 
+    });
   }
 });
 
-// Route pour obtenir les statistiques (Admin)
-app.get('/api/admin/stats', async (req, res) => {
-  try {
-    const withdrawalsRef = db.collection('withdrawals');
-    
-    const [totalSnap, pendingSnap, approvedSnap, rejectedSnap] = await Promise.all([
-      withdrawalsRef.get(),
-      withdrawalsRef.where('status', '==', 'pending').get(),
-      withdrawalsRef.where('status', '==', 'approved').get(),
-      withdrawalsRef.where('status', '==', 'rejected').get()
-    ]);
-
-    res.json({
-      status: 'success',
-      data: {
-        total: totalSnap.size,
-        pending: pendingSnap.size,
-        approved: approvedSnap.size,
-        rejected: rejectedSnap.size,
-        failed: totalSnap.docs.filter(doc => doc.data().status === 'failed').length
-      }
-    });
-  } catch (error) {
-    console.error('Error fetching stats:', error.message);
-    res.status(500).json({ error: 'Failed to fetch statistics' });
-  }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
-  console.log(`🔥 Firestore connected`);
-  console.log(`🌐 Base URL: ${BASE_URL}`);
-});
+// ===== EXPORT POUR VERCEL =====
+module.exports = app;
