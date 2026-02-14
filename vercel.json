@@ -1,0 +1,24 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/**/*.js",
+      "use": "@vercel/node"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "/api/$1"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/public/$1"
+    }
+  ],
+  "env": {
+    "FIREBASE_SERVICE_ACCOUNT": "@firebase_service_account",
+    "EZIPAY_CLIENT_ID": "@ezipay_client_id",
+    "EZIPAY_CLIENT_SECRET": "@ezipay_client_secret"
+  }
+}
